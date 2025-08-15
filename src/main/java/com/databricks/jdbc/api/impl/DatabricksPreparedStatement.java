@@ -9,6 +9,7 @@ import static com.databricks.jdbc.common.util.ValidationUtil.throwErrorIfNull;
 
 import com.databricks.jdbc.common.StatementType;
 import com.databricks.jdbc.common.util.DatabricksTypeUtil;
+import com.databricks.jdbc.common.util.InsertStatementParser;
 import com.databricks.jdbc.exception.*;
 import com.databricks.jdbc.log.JdbcLogger;
 import com.databricks.jdbc.log.JdbcLoggerFactory;
@@ -88,6 +89,83 @@ public class DatabricksPreparedStatement extends DatabricksStatement implements 
   @Override
   public long[] executeLargeBatch() throws DatabricksBatchUpdateException {
     LOGGER.debug("public long executeLargeBatch()");
+
+    if (databricksBatchParameterMetaData.isEmpty()) {
+      return new long[0];
+    }
+
+    // Try to optimize INSERT statements with multi-row batching
+    if (canUseBatchedInsert()) {
+      return executeBatchedInsert();
+    } else {
+      // Fall back to individual execution for non-INSERT or incompatible statements
+      return executeIndividualStatements();
+    }
+  }
+
+  /**
+   * Checks if the current batch can be optimized using multi-row INSERT. All statements must be
+   * compatible INSERT operations.
+   */
+  private boolean canUseBatchedInsert() {
+    if (!DatabricksStatement.isInsertQuery(sql)) {
+      return false;
+    }
+
+    InsertStatementParser.InsertInfo insertInfo = InsertStatementParser.parseInsert(sql);
+    return insertInfo != null && !databricksBatchParameterMetaData.isEmpty();
+  }
+
+  /** Executes the batch as a single multi-row INSERT statement. */
+  private long[] executeBatchedInsert() throws DatabricksBatchUpdateException {
+    LOGGER.debug("Executing batched INSERT with {} rows", databricksBatchParameterMetaData.size());
+
+    try {
+      InsertStatementParser.InsertInfo insertInfo = InsertStatementParser.parseInsert(sql);
+      String multiRowSql =
+          InsertStatementParser.generateMultiRowInsert(
+              insertInfo, databricksBatchParameterMetaData.size());
+
+      // Combine all parameters into a single parameter map
+      Map<Integer, ImmutableSqlParameter> combinedParams = new HashMap<>();
+      int paramIndex = 1;
+
+      for (DatabricksParameterMetaData batchParams : databricksBatchParameterMetaData) {
+        Map<Integer, ImmutableSqlParameter> rowParams = batchParams.getParameterBindings();
+        for (int i = 1; i <= rowParams.size(); i++) {
+          if (rowParams.containsKey(i)) {
+            combinedParams.put(paramIndex++, rowParams.get(i));
+          }
+        }
+      }
+
+      executeInternal(multiRowSql, combinedParams, StatementType.UPDATE, false);
+      long totalUpdateCount = resultSet.getUpdateCount();
+
+      // Distribute the update count evenly across all batch entries
+      // Each INSERT typically affects 1 row per batch entry
+      long[] updateCounts = new long[databricksBatchParameterMetaData.size()];
+      for (int i = 0; i < updateCounts.length; i++) {
+        updateCounts[i] = 1; // Each row inserted affects 1 row
+      }
+
+      return updateCounts;
+
+    } catch (Exception e) {
+      LOGGER.error("Error executing batched INSERT: {}", e.getMessage(), e);
+      long[] failedCounts = new long[databricksBatchParameterMetaData.size()];
+      for (int i = 0; i < failedCounts.length; i++) {
+        failedCounts[i] = Statement.EXECUTE_FAILED;
+      }
+      throw new DatabricksBatchUpdateException(
+          e.getMessage(), DatabricksDriverErrorCode.BATCH_EXECUTE_EXCEPTION, failedCounts);
+    }
+  }
+
+  /** Executes batch statements individually (fallback method). */
+  private long[] executeIndividualStatements() throws DatabricksBatchUpdateException {
+    LOGGER.debug(
+        "Executing batch individually with {} statements", databricksBatchParameterMetaData.size());
     long[] largeUpdateCount = new long[databricksBatchParameterMetaData.size()];
 
     for (int sqlQueryIndex = 0;
