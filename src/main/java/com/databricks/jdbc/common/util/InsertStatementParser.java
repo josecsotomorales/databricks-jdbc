@@ -41,6 +41,10 @@ public class InsertStatementParser {
       return originalSql;
     }
 
+    public int getColumnCount() {
+      return columns.size();
+    }
+
     /**
      * Checks if this INSERT is compatible with another INSERT for batching. Two INSERTs are
      * compatible if they target the same table with the same columns.

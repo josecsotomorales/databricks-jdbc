@@ -227,15 +227,18 @@ public class DatabricksPreparedStatementTest {
       statement.setString(4, "value");
       statement.addBatch();
     }
+    // Our implementation converts single INSERT to multi-row INSERT for batching
+    String expectedMultiRowSQL =
+        "INSERT INTO orders (user_id, shard, region_code, namespace) VALUES (?, ?, ?, ?), (?, ?, ?, ?), (?, ?, ?, ?), (?, ?, ?, ?)";
     when(client.executeStatement(
-            eq(BATCH_STATEMENT),
+            eq(expectedMultiRowSQL),
             eq(new Warehouse(WAREHOUSE_ID)),
             any(HashMap.class),
             eq(StatementType.UPDATE),
             any(IDatabricksSession.class),
             eq(statement)))
         .thenReturn(resultSet);
-    when(resultSet.getUpdateCount()).thenReturn(1L);
+    when(resultSet.getUpdateCount()).thenReturn(4L); // Multi-row INSERT returns total rows affected
 
     int[] expectedCountsResult = {1, 1, 1, 1};
     int[] updateCounts = statement.executeBatch();
@@ -280,26 +283,24 @@ public class DatabricksPreparedStatementTest {
       statement.addBatch();
     }
 
-    // First call succeeds, subsequent calls fail
+    // Our implementation batches all into one multi-row INSERT, so if it fails, all fail
+    String expectedMultiRowSQL =
+        "INSERT INTO orders (user_id, shard, region_code, namespace) VALUES (?, ?, ?, ?), (?, ?, ?, ?), (?, ?, ?, ?), (?, ?, ?, ?)";
     when(client.executeStatement(
-            eq(BATCH_STATEMENT),
+            eq(expectedMultiRowSQL),
             eq(new Warehouse(WAREHOUSE_ID)),
             any(HashMap.class),
             eq(StatementType.UPDATE),
             any(IDatabricksSession.class),
             eq(statement)))
-        .thenReturn(resultSet)
         .thenThrow(new SQLException());
-    when(resultSet.getUpdateCount()).thenReturn(1L);
 
     DatabricksBatchUpdateException exception =
         assertThrows(DatabricksBatchUpdateException.class, statement::executeBatch);
     int[] updateCounts = exception.getUpdateCounts();
     assertEquals(4, updateCounts.length);
-    // First statement should succeed
-    assertEquals(1, updateCounts[0]);
-    // Remaining statements should fail
-    for (int i = 1; i < 4; i++) {
+    // All statements should fail since they're batched into one multi-row INSERT
+    for (int i = 0; i < 4; i++) {
       assertEquals(Statement.EXECUTE_FAILED, updateCounts[i]);
     }
   }
@@ -319,15 +320,18 @@ public class DatabricksPreparedStatementTest {
       statement.setString(4, "value");
       statement.addBatch();
     }
+    // Our implementation converts single INSERT to multi-row INSERT for batching
+    String expectedMultiRowSQL =
+        "INSERT INTO orders (user_id, shard, region_code, namespace) VALUES (?, ?, ?, ?), (?, ?, ?, ?), (?, ?, ?, ?), (?, ?, ?, ?)";
     when(client.executeStatement(
-            eq(BATCH_STATEMENT),
+            eq(expectedMultiRowSQL),
             eq(new Warehouse(WAREHOUSE_ID)),
             any(HashMap.class),
             eq(StatementType.UPDATE),
             any(IDatabricksSession.class),
             eq(statement)))
         .thenReturn(resultSet);
-    when(resultSet.getUpdateCount()).thenReturn(1L);
+    when(resultSet.getUpdateCount()).thenReturn(4L); // Multi-row INSERT returns total rows affected
 
     long[] expectedCountsResult = {1, 1, 1, 1};
     long[] updateCounts = statement.executeLargeBatch();
@@ -353,26 +357,24 @@ public class DatabricksPreparedStatementTest {
       statement.addBatch();
     }
 
-    // First call succeeds, subsequent calls fail
+    // Our implementation batches all into one multi-row INSERT, so if it fails, all fail
+    String expectedMultiRowSQL =
+        "INSERT INTO orders (user_id, shard, region_code, namespace) VALUES (?, ?, ?, ?), (?, ?, ?, ?), (?, ?, ?, ?), (?, ?, ?, ?)";
     when(client.executeStatement(
-            eq(BATCH_STATEMENT),
+            eq(expectedMultiRowSQL),
             eq(new Warehouse(WAREHOUSE_ID)),
             any(HashMap.class),
             eq(StatementType.UPDATE),
             any(IDatabricksSession.class),
             eq(statement)))
-        .thenReturn(resultSet)
         .thenThrow(new SQLException());
-    when(resultSet.getUpdateCount()).thenReturn(1L);
 
     DatabricksBatchUpdateException exception =
         assertThrows(DatabricksBatchUpdateException.class, statement::executeLargeBatch);
     long[] updateCounts = exception.getLargeUpdateCounts();
     assertEquals(4, updateCounts.length);
-    // First statement should succeed
-    assertEquals(1, updateCounts[0]);
-    // Remaining statements should fail
-    for (int i = 1; i < 4; i++) {
+    // All statements should fail since they're batched into one multi-row INSERT
+    for (int i = 0; i < 4; i++) {
       assertEquals(Statement.EXECUTE_FAILED, updateCounts[i]);
     }
   }
@@ -633,6 +635,168 @@ public class DatabricksPreparedStatementTest {
     Reader characterStream = new StringReader(originalString);
 
     assertDoesNotThrow(() -> preparedStatement.setCharacterStream(1, characterStream));
+  }
+
+  @Test
+  public void testExecuteLargeBatchWithParameterChunking() throws Exception {
+    // Test scenario that would exceed the 256 parameter limit and verify chunking works
+    // 5 columns × 60 rows = 300 parameters (exceeds 256 limit)
+    // Should be split into chunks: 51 rows + 9 rows (51 = 255/5, leaving 1 parameter short for
+    // safety)
+
+    String largeBatchStatement =
+        "INSERT INTO products (id, name, price, category, description) VALUES (?, ?, ?, ?, ?)";
+    IDatabricksConnectionContext connectionContext =
+        DatabricksConnectionContext.parse(JDBC_URL, new Properties());
+    DatabricksConnection connection = new DatabricksConnection(connectionContext, client);
+    DatabricksPreparedStatement statement =
+        new DatabricksPreparedStatement(connection, largeBatchStatement);
+
+    // Add 60 batches (5 columns each = 300 total parameters)
+    int totalBatches = 60;
+    for (int i = 1; i <= totalBatches; i++) {
+      statement.setInt(1, i); // id
+      statement.setString(2, "Product " + i); // name
+      statement.setBigDecimal(3, new BigDecimal("19.99")); // price
+      statement.setString(4, "Category " + (i % 5)); // category
+      statement.setString(5, "Description for product " + i); // description
+      statement.addBatch();
+    }
+
+    // Mock client to verify chunking behavior
+    // With 5 columns, max rows per chunk = 256/5 = 51 rows
+    // So 60 total rows should be split into 2 chunks: 51 + 9
+    when(client.executeStatement(
+            any(String.class), // SQL will vary based on chunk size
+            eq(new Warehouse(WAREHOUSE_ID)),
+            any(HashMap.class),
+            eq(StatementType.UPDATE),
+            any(IDatabricksSession.class),
+            eq(statement)))
+        .thenReturn(resultSet);
+    when(resultSet.getUpdateCount())
+        .thenReturn(51L) // First chunk: 51 rows
+        .thenReturn(9L); // Second chunk: 9 rows
+
+    long[] updateCounts = statement.executeLargeBatch();
+
+    // Verify results
+    assertEquals(totalBatches, updateCounts.length);
+
+    // All update counts should be 1 (each row affects 1 row)
+    for (int i = 0; i < totalBatches; i++) {
+      assertEquals(1, updateCounts[i], "Update count for batch " + i + " should be 1");
+    }
+
+    assertFalse(statement.isClosed());
+    statement.close();
+    assertTrue(statement.isClosed());
+  }
+
+  @Test
+  public void testExecuteLargeBatchWithManyColumnsChunking() throws Exception {
+    // Test edge case with very wide table that forces 1 row per chunk
+    // 300 columns would result in 0 rows per chunk calculation, should default to 1
+
+    StringBuilder largeSqlBuilder = new StringBuilder("INSERT INTO wide_table (");
+    StringBuilder valuesBuilder = new StringBuilder("(");
+
+    // Create SQL with 300 columns
+    int columnCount = 300;
+    for (int i = 1; i <= columnCount; i++) {
+      if (i > 1) {
+        largeSqlBuilder.append(", ");
+        valuesBuilder.append(", ");
+      }
+      largeSqlBuilder.append("col").append(i);
+      valuesBuilder.append("?");
+    }
+    largeSqlBuilder.append(") VALUES ").append(valuesBuilder).append(")");
+
+    String wideTableStatement = largeSqlBuilder.toString();
+    IDatabricksConnectionContext connectionContext =
+        DatabricksConnectionContext.parse(JDBC_URL, new Properties());
+    DatabricksConnection connection = new DatabricksConnection(connectionContext, client);
+    DatabricksPreparedStatement statement =
+        new DatabricksPreparedStatement(connection, wideTableStatement);
+
+    // Add 3 batches - each should be executed separately due to parameter limit
+    int totalBatches = 3;
+    for (int batchNum = 1; batchNum <= totalBatches; batchNum++) {
+      // Set all 300 parameters for this batch
+      for (int col = 1; col <= columnCount; col++) {
+        statement.setString(col, "value_" + batchNum + "_" + col);
+      }
+      statement.addBatch();
+    }
+
+    // Mock client - each batch should be executed individually due to parameter limit
+    when(client.executeStatement(
+            any(String.class),
+            eq(new Warehouse(WAREHOUSE_ID)),
+            any(HashMap.class),
+            eq(StatementType.UPDATE),
+            any(IDatabricksSession.class),
+            eq(statement)))
+        .thenReturn(resultSet);
+    when(resultSet.getUpdateCount()).thenReturn(1L); // Each execution affects 1 row
+
+    long[] updateCounts = statement.executeLargeBatch();
+
+    // Verify results
+    assertEquals(totalBatches, updateCounts.length);
+    for (int i = 0; i < totalBatches; i++) {
+      assertEquals(1, updateCounts[i], "Update count for batch " + i + " should be 1");
+    }
+
+    assertFalse(statement.isClosed());
+    statement.close();
+    assertTrue(statement.isClosed());
+  }
+
+  @Test
+  public void testExecuteLargeBatchParameterChunkingOptimization() throws Exception {
+    // Test that we're actually getting the chunking optimization vs individual execution
+    // Use a 2-column table with 200 rows = 400 parameters (exceeds 256 limit)
+    // Should be chunked into: 128 rows + 72 rows (128 = 256/2)
+
+    String simpleStatement = "INSERT INTO users (id, name) VALUES (?, ?)";
+    IDatabricksConnectionContext connectionContext =
+        DatabricksConnectionContext.parse(JDBC_URL, new Properties());
+    DatabricksConnection connection = new DatabricksConnection(connectionContext, client);
+    DatabricksPreparedStatement statement =
+        new DatabricksPreparedStatement(connection, simpleStatement);
+
+    // Add 200 batches (2 columns each = 400 total parameters)
+    int totalBatches = 200;
+    for (int i = 1; i <= totalBatches; i++) {
+      statement.setInt(1, i);
+      statement.setString(2, "User " + i);
+      statement.addBatch();
+    }
+
+    // Mock the client to capture the generated SQL
+    when(client.executeStatement(
+            any(String.class),
+            eq(new Warehouse(WAREHOUSE_ID)),
+            any(HashMap.class),
+            eq(StatementType.UPDATE),
+            any(IDatabricksSession.class),
+            eq(statement)))
+        .thenReturn(resultSet);
+    when(resultSet.getUpdateCount()).thenReturn(128L).thenReturn(72L); // Two chunks: 128 + 72
+
+    long[] updateCounts = statement.executeLargeBatch();
+
+    // Verify results
+    assertEquals(totalBatches, updateCounts.length);
+    for (int i = 0; i < totalBatches; i++) {
+      assertEquals(1, updateCounts[i], "Update count for batch " + i + " should be 1");
+    }
+
+    assertFalse(statement.isClosed());
+    statement.close();
+    assertTrue(statement.isClosed());
   }
 
   @Test

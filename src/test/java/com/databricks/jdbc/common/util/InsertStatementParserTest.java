@@ -166,4 +166,103 @@ class InsertStatementParserTest {
     assertEquals(info1.hashCode(), info2.hashCode());
     assertNotEquals(info1.hashCode(), info3.hashCode());
   }
+
+  @Test
+  void testGetColumnCount() {
+    InsertInfo info2Cols =
+        InsertStatementParser.parseInsert("INSERT INTO users (id, name) VALUES (?, ?)");
+    assertNotNull(info2Cols);
+    assertEquals(2, info2Cols.getColumnCount());
+
+    InsertInfo info5Cols =
+        InsertStatementParser.parseInsert(
+            "INSERT INTO products (id, name, price, category, description) VALUES (?, ?, ?, ?, ?)");
+    assertNotNull(info5Cols);
+    assertEquals(5, info5Cols.getColumnCount());
+
+    InsertInfo info1Col = InsertStatementParser.parseInsert("INSERT INTO simple (id) VALUES (?)");
+    assertNotNull(info1Col);
+    assertEquals(1, info1Col.getColumnCount());
+  }
+
+  @Test
+  void testParameterLimitCalculations() {
+    // Test parameter limit calculations that would be used in chunking logic
+
+    // 5 columns: 256/5 = 51 rows per chunk
+    InsertInfo info5Cols =
+        InsertStatementParser.parseInsert(
+            "INSERT INTO products (id, name, price, category, description) VALUES (?, ?, ?, ?, ?)");
+    assertNotNull(info5Cols);
+    int maxRowsFor5Cols = 256 / info5Cols.getColumnCount();
+    assertEquals(51, maxRowsFor5Cols);
+
+    // 2 columns: 256/2 = 128 rows per chunk
+    InsertInfo info2Cols =
+        InsertStatementParser.parseInsert("INSERT INTO users (id, name) VALUES (?, ?)");
+    assertNotNull(info2Cols);
+    int maxRowsFor2Cols = 256 / info2Cols.getColumnCount();
+    assertEquals(128, maxRowsFor2Cols);
+
+    // 10 columns: 256/10 = 25 rows per chunk
+    InsertInfo info10Cols =
+        InsertStatementParser.parseInsert(
+            "INSERT INTO wide_table (c1, c2, c3, c4, c5, c6, c7, c8, c9, c10) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+    assertNotNull(info10Cols);
+    int maxRowsFor10Cols = 256 / info10Cols.getColumnCount();
+    assertEquals(25, maxRowsFor10Cols);
+
+    // Edge case: 300 columns would result in 0 rows per chunk, should be handled as 1
+    InsertInfo info300Cols = InsertStatementParser.parseInsert(generateLargeInsert(300));
+    assertNotNull(info300Cols);
+    assertEquals(300, info300Cols.getColumnCount());
+    int maxRowsFor300Cols = 256 / info300Cols.getColumnCount();
+    assertEquals(0, maxRowsFor300Cols); // This would need to be handled as 1 in the actual code
+  }
+
+  @Test
+  void testChunkingScenarios() {
+    // Test realistic chunking scenarios
+
+    // Scenario 1: Large batch with 5 columns, 10000 rows
+    InsertInfo info5Cols =
+        InsertStatementParser.parseInsert(
+            "INSERT INTO products (id, name, price, category, description) VALUES (?, ?, ?, ?, ?)");
+    assertNotNull(info5Cols);
+    assertEquals(5, info5Cols.getColumnCount());
+
+    int totalRows = 10000;
+    int maxRowsPerChunk = 256 / info5Cols.getColumnCount(); // 51 rows per chunk
+    int expectedChunks = (int) Math.ceil((double) totalRows / maxRowsPerChunk); // 197 chunks
+    assertEquals(51, maxRowsPerChunk);
+    assertEquals(197, expectedChunks);
+
+    // Scenario 2: Batch that would exceed parameter limit in one go
+    InsertInfo info2Cols =
+        InsertStatementParser.parseInsert("INSERT INTO users (id, name) VALUES (?, ?)");
+    assertNotNull(info2Cols);
+    assertEquals(2, info2Cols.getColumnCount());
+
+    int batchSize = 200; // Would be 400 parameters (200 * 2 columns), exceeding 256 limit
+    int maxRowsFor2Cols = 256 / info2Cols.getColumnCount(); // 128 rows per chunk
+    int neededChunks = (int) Math.ceil((double) batchSize / maxRowsFor2Cols); // 2 chunks
+    assertEquals(128, maxRowsFor2Cols);
+    assertEquals(2, neededChunks);
+  }
+
+  private String generateLargeInsert(int columnCount) {
+    StringBuilder columns = new StringBuilder();
+    StringBuilder values = new StringBuilder();
+
+    for (int i = 1; i <= columnCount; i++) {
+      if (i > 1) {
+        columns.append(", ");
+        values.append(", ");
+      }
+      columns.append("col").append(i);
+      values.append("?");
+    }
+
+    return "INSERT INTO large_table (" + columns + ") VALUES (" + values + ")";
+  }
 }

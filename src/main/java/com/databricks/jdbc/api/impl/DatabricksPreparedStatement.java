@@ -7,6 +7,7 @@ import static com.databricks.jdbc.common.util.SQLInterpolator.interpolateSQL;
 import static com.databricks.jdbc.common.util.SQLInterpolator.surroundPlaceholdersWithQuotes;
 import static com.databricks.jdbc.common.util.ValidationUtil.throwErrorIfNull;
 
+import com.databricks.jdbc.common.DatabricksJdbcConstants;
 import com.databricks.jdbc.common.StatementType;
 import com.databricks.jdbc.common.util.DatabricksTypeUtil;
 import com.databricks.jdbc.common.util.InsertStatementParser;
@@ -122,34 +123,63 @@ public class DatabricksPreparedStatement extends DatabricksStatement implements 
 
     try {
       InsertStatementParser.InsertInfo insertInfo = InsertStatementParser.parseInsert(sql);
-      String multiRowSql =
-          InsertStatementParser.generateMultiRowInsert(
-              insertInfo, databricksBatchParameterMetaData.size());
+      if (insertInfo == null) {
+        throw new DatabricksSQLException(
+            "Unable to parse INSERT statement", DatabricksDriverErrorCode.BATCH_EXECUTE_EXCEPTION);
+      }
 
-      // Combine all parameters into a single parameter map
-      Map<Integer, ImmutableSqlParameter> combinedParams = new HashMap<>();
-      int paramIndex = 1;
+      // Calculate how many rows we can fit in one chunk based on parameter limit
+      int parametersPerRow = insertInfo.getColumnCount();
+      int maxRowsPerChunk = DatabricksJdbcConstants.MAX_QUERY_PARAMETERS / parametersPerRow;
 
-      for (DatabricksParameterMetaData batchParams : databricksBatchParameterMetaData) {
-        Map<Integer, ImmutableSqlParameter> rowParams = batchParams.getParameterBindings();
-        for (int i = 1; i <= rowParams.size(); i++) {
-          if (rowParams.containsKey(i)) {
-            combinedParams.put(paramIndex++, rowParams.get(i));
+      // Ensure we have at least 1 row per chunk
+      if (maxRowsPerChunk < 1) {
+        maxRowsPerChunk = 1;
+      }
+
+      long[] allUpdateCounts = new long[databricksBatchParameterMetaData.size()];
+      int processedRows = 0;
+
+      // Process batches in chunks
+      for (int startIndex = 0;
+          startIndex < databricksBatchParameterMetaData.size();
+          startIndex += maxRowsPerChunk) {
+        int endIndex =
+            Math.min(startIndex + maxRowsPerChunk, databricksBatchParameterMetaData.size());
+        int chunkSize = endIndex - startIndex;
+
+        LOGGER.debug("Processing chunk {}-{} ({} rows)", startIndex + 1, endIndex, chunkSize);
+
+        // Generate multi-row SQL for this chunk
+        String multiRowSql = InsertStatementParser.generateMultiRowInsert(insertInfo, chunkSize);
+
+        // Combine parameters for this chunk
+        Map<Integer, ImmutableSqlParameter> chunkParams = new HashMap<>();
+        int paramIndex = 1;
+
+        for (int i = startIndex; i < endIndex; i++) {
+          DatabricksParameterMetaData batchParams = databricksBatchParameterMetaData.get(i);
+          Map<Integer, ImmutableSqlParameter> rowParams = batchParams.getParameterBindings();
+          for (int j = 1; j <= rowParams.size(); j++) {
+            if (rowParams.containsKey(j)) {
+              chunkParams.put(paramIndex++, rowParams.get(j));
+            }
           }
         }
+
+        // Execute this chunk
+        executeInternal(multiRowSql, chunkParams, StatementType.UPDATE, false);
+
+        // Set update counts for this chunk (each row typically affects 1 row)
+        for (int i = startIndex; i < endIndex; i++) {
+          allUpdateCounts[i] = 1;
+        }
+
+        processedRows += chunkSize;
       }
 
-      executeInternal(multiRowSql, combinedParams, StatementType.UPDATE, false);
-      long totalUpdateCount = resultSet.getUpdateCount();
-
-      // Distribute the update count evenly across all batch entries
-      // Each INSERT typically affects 1 row per batch entry
-      long[] updateCounts = new long[databricksBatchParameterMetaData.size()];
-      for (int i = 0; i < updateCounts.length; i++) {
-        updateCounts[i] = 1; // Each row inserted affects 1 row
-      }
-
-      return updateCounts;
+      LOGGER.debug("Successfully processed {} rows in chunks", processedRows);
+      return allUpdateCounts;
 
     } catch (Exception e) {
       LOGGER.error("Error executing batched INSERT: {}", e.getMessage(), e);
